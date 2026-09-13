@@ -2,7 +2,7 @@ from .rm.cfg import ConfigManager
 from .rm.db import TaskDBFactory, Record as GCHRecord
 from .rm.metadata import resolve_record_metadata
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 
 from functools import cached_property
 from textwrap import dedent
@@ -21,7 +21,11 @@ class WorkContext:
         self.work_record = work_record
         self.config_manager = config_manager
 
-    
+
+    @property
+    def id(self):
+        return self.work_record.id
+
 
     @cached_property
     def path(self)->Path:
@@ -45,6 +49,18 @@ class WorkContext:
             lazy_handling=False,
         )
 
+    @property
+    def eval_dataset_ids(self):
+        return self.metadata["eval_dataset_ids"]
+
+    @property
+    def eval_epochs(self):
+        return self.metadata.get("eval_epochs", [])
+
+    @property
+    def eval_steps(self):
+        return self.metadata.get("eval_steps", [])
+
     @cached_property
     def config_path(self)->Path:
         return self.work_record.config_file_path
@@ -53,50 +69,79 @@ class WorkContext:
     def config(self)->dict:
         return self.config_manager.load_config(self.config_path, handling=True, lazy_handling=False)
 
-    
+    def _invalidate_task_cache(self)->None:
+        self.__dict__.pop("all_tasks", None)
 
-
-
-    def get_train_task_context(self, task_record)->'TrainTaskContext':
-        
-        return TrainTaskContext(
+    def _context_for_record(self, record: GCHRecord) -> Union['TrainTaskContext', 'EvalTaskContext']:
+        peek = TaskContext(
             work_record=self.work_record,
-            task_record=task_record, 
-            config_manager=self.config_manager
+            task_record=record,
+            config_manager=self.config_manager,
         )
+        task_type = peek.metadata['type']
+        if task_type == "train":
+            return TrainTaskContext(
+                work_record=self.work_record,
+                task_record=record,
+                config_manager=self.config_manager,
+            )
+        if task_type == "test":
+            return EvalTaskContext(
+                work_record=self.work_record,
+                task_record=record,
+                config_manager=self.config_manager,
+            )
+        raise ValueError(f"Invalid task type: {task_type}")
 
-    def get_eval_task_context(self, task_record)->'EvalTaskContext':
-        
-        return EvalTaskContext(
-            work_record=self.work_record,
-            task_record=task_record, 
-            config_manager=self.config_manager
-        )
+    def get_task(self, task_id) -> Optional[Union['TrainTaskContext', 'EvalTaskContext']]:
+        if task_id not in self.task_db:
+            return None
+        return self._context_for_record(self.task_db.get_record(task_id))
 
-    def get_train_task_record(self)->Optional[GCHRecord]:
-        if self.TRAIN_TASK_ID in self.task_db:
-            return self.task_db.get_record(self.TRAIN_TASK_ID)
-        else:
+    def train_task(self) -> Optional['TrainTaskContext']:
+        if self.TRAIN_TASK_ID not in self.task_db:
+            return None
+        context = self.get_task(self.TRAIN_TASK_ID)
+        if context is None:
+            return None
+        if not isinstance(context, TrainTaskContext):
+            raise ValueError(f"Task {self.TRAIN_TASK_ID} is not a train task")
+        return context
+
+    def eval_task(self, dataset_id, *, epoch=None, step=None) -> Optional['EvalTaskContext']:
+        mode, value = self._resolve_eval_point(epoch=epoch, step=step)
+        try:
+            return self.all_tasks["test"][dataset_id][mode][value]
+        except KeyError:
             return None
 
-    
-
-    def make_train_task(self)->GCHRecord:
-        train_task = self.get_train_task_record()
-        if train_task is None:
-            train_task = self.task_db.create_record("train")
-            assert train_task.id == self.TRAIN_TASK_ID, "Train task id is not " + str(self.TRAIN_TASK_ID) + " This means that other tasks were created before the train task"
-            self.get_train_task_context(train_task).initialize()
-        return train_task
-
+    def make_train_task(self) -> 'TrainTaskContext':
+        existing = self.train_task()
+        if existing is not None:
+            return existing
+        record = self.task_db.create_record("train")
+        assert record.id == self.TRAIN_TASK_ID, (
+            "Train task id is not " + str(self.TRAIN_TASK_ID)
+            + " This means that other tasks were created before the train task"
+        )
+        context = TrainTaskContext(
+            work_record=self.work_record,
+            task_record=record,
+            config_manager=self.config_manager,
+        )
+        context.initialize()
+        self._invalidate_task_cache()
+        return context
 
     def remove_train_task(self, dry_run: bool = False)->None:
-        train_task = self.get_train_task_record()
-        if train_task is not None:
-            if dry_run:
-                print(train_task.path)
-            else:
-                shutil.rmtree(train_task.path)
+        train_task = self.train_task()
+        if train_task is None:
+            return
+        if dry_run:
+            print(train_task.path)
+        else:
+            shutil.rmtree(train_task.path)
+            self._invalidate_task_cache()
 
     def remove_all_tasks(self, dry_run: bool = False)->None:
         for task_id in list(self.task_db.ids):
@@ -106,55 +151,37 @@ class WorkContext:
             else:
                 shutil.rmtree(path)
         if not dry_run:
-            self.__dict__.pop("all_tasks", None)
+            self._invalidate_task_cache()
 
     def remove_all_eval_tasks(self, dry_run: bool = False)->None:
         for task_id in list(self.task_db.ids):
-            if task_id == self.TRAIN_TASK_ID:
-                continue
-            record = self.task_db.get_record(task_id)
-            task_type = self.get_eval_task_context(record).metadata.get("type")
-            if task_type != "test":
+            context = self.get_task(task_id)
+            if not isinstance(context, EvalTaskContext):
                 continue
             if dry_run:
-                print(record.path)
+                print(context.path)
             else:
-                shutil.rmtree(record.path)
+                shutil.rmtree(context.path)
         if not dry_run:
             test_dir = self.path / "test"
             if test_dir.exists():
                 shutil.rmtree(test_dir)
-            self.__dict__.pop("all_tasks", None)
+            self._invalidate_task_cache()
 
     @cached_property
     def all_tasks(self)->Dict:
         tasks = {}
-        for id in self.task_db.ids:
-            record = self.task_db.get_record(id)
-            context = self.get_train_task_context(record)
-            metadata = context.metadata
-            task_type = metadata['type']
-            dataset_id = metadata.get('dataset_id', None)
-            epoch = metadata.get('epoch', None)
-            step = metadata.get('step', None)
-
-
-            if task_type == "train":
+        for task_id in self.task_db.ids:
+            context = self.get_task(task_id)
+            if isinstance(context, TrainTaskContext):
                 assert "train" not in tasks, "Train task already exists"
-                tasks["train"] = record
-            elif task_type == "test":
-                assert dataset_id is not None, "Eval task must have dataset id in metadata, but it's not set"
-                assert (epoch is None) != (step is None), (
-                    "Eval task must have exactly one of epoch or step in metadata."
-                )
-                if epoch is not None:
-                    tasks.setdefault("test", {}).setdefault(dataset_id, {}).setdefault(
-                        "epoch", {})[epoch] = record
-                else:
-                    tasks.setdefault("test", {}).setdefault(dataset_id, {}).setdefault(
-                        "step", {})[step] = record
+                tasks["train"] = context
+            elif isinstance(context, EvalTaskContext):
+                mode, value = context.eval_point
+                tasks.setdefault("test", {}).setdefault(context.dataset_id, {}).setdefault(
+                    mode, {})[value] = context
             else:
-                raise ValueError(f"Invalid task type: {task_type}")
+                raise ValueError(f"Invalid task type for id {task_id}")
         return tasks
 
 
@@ -168,8 +195,8 @@ class WorkContext:
     def is_eval_point_in_metadata(self, epoch=None, step=None) -> bool:
         mode, value = self._resolve_eval_point(epoch=epoch, step=step)
         if mode == "epoch":
-            return value in self.metadata.get("eval_epochs", [])
-        return value in self.metadata.get("eval_steps", [])
+            return value in self.eval_epochs
+        return value in self.eval_steps
 
     def make_eval_record_name(self, eval_dataset_id, epoch=None, step=None)->str:
         mode, value = self._resolve_eval_point(epoch=epoch, step=step)
@@ -177,35 +204,28 @@ class WorkContext:
             return f"test/dataset_{eval_dataset_id}/epoch_{value}"
         return f"test/dataset_{eval_dataset_id}/iter_{value}"
 
-    def get_eval_task_record(self, eval_dataset_id, epoch=None, step=None)->Optional[GCHRecord]:
-        """
-            task_record가 존재하면 반환
-            없으면 None 반환
-        """
-        mode, value = self._resolve_eval_point(epoch=epoch, step=step)
-        all_tasks = self.all_tasks
-        if "test" not in all_tasks:
-            return None
-        if eval_dataset_id not in all_tasks["test"]:
-            return None
-        dataset_tasks = all_tasks["test"][eval_dataset_id]
-        if mode not in dataset_tasks:
-            return None
-        if value not in dataset_tasks[mode]:
-            return None
-        return dataset_tasks[mode][value]
-        
-    def _get_train_task_context(self)->Optional['TrainTaskContext']:
-        train_record = self.get_train_task_record()
-        if train_record is None:
-            return None
-        return self.get_train_task_context(train_record)
-
-    def _eval_checkpoint_exists(self, train_ctx: 'TrainTaskContext', *, epoch=None, step=None) -> bool:
+    def has_eval_checkpoint(
+        self,
+        epoch=None,
+        step=None,
+        train_ctx: Optional['TrainTaskContext'] = None,
+    ) -> bool:
+        if train_ctx is None:
+            train_ctx = self.train_task()
+        if train_ctx is None:
+            return False
         mode, value = self._resolve_eval_point(epoch=epoch, step=step)
         if mode == "epoch":
             return train_ctx.does_weight_exists(value)
         return train_ctx.does_step_weight_exists(value)
+
+    def eval_tasks(self) -> List['EvalTaskContext']:
+        tasks = []
+        for task_id in self.task_db.ids:
+            context = self.get_task(task_id)
+            if isinstance(context, EvalTaskContext):
+                tasks.append(context)
+        return tasks
 
     def make_eval_task(
         self,
@@ -214,145 +234,80 @@ class WorkContext:
         step=None,
         check_weight: bool = False,
         train_ctx: Optional['TrainTaskContext'] = None,
-    ) -> Optional[GCHRecord]:
+    ) -> Optional['EvalTaskContext']:
         """
             check_weight가 True이면 해당 epoch/step weight가 있을 때만 새 task를 생성한다.
             이미 task가 있으면 weight 여부와 관계없이 반환한다.
             train_ctx가 넘어오면 weight 체크에 재사용하고, 없으면 필요할 때 조회한다.
         """
         mode, value = self._resolve_eval_point(epoch=epoch, step=step)
-        record = self.get_eval_task_record(
+        epoch_arg = value if mode == "epoch" else None
+        step_arg = value if mode == "step" else None
+        existing = self.eval_task(eval_dataset_id, epoch=epoch_arg, step=step_arg)
+        if existing is not None:
+            return existing
+        if check_weight:
+            if train_ctx is None:
+                train_ctx = self.train_task()
+            if train_ctx is None:
+                return None
+            if not self.has_eval_checkpoint(
+                epoch=epoch_arg,
+                step=step_arg,
+                train_ctx=train_ctx,
+            ):
+                return None
+        record_name = self.make_eval_record_name(
             eval_dataset_id,
-            epoch=value if mode == "epoch" else None,
-            step=value if mode == "step" else None,
+            epoch=epoch_arg,
+            step=step_arg,
         )
-        if record is None:
-            if check_weight:
-                if train_ctx is None:
-                    train_ctx = self._get_train_task_context()
-                if train_ctx is None:
-                    return None
-                if not self._eval_checkpoint_exists(
-                    train_ctx,
-                    epoch=value if mode == "epoch" else None,
-                    step=value if mode == "step" else None,
-                ):
-                    return None
-            record_name = self.make_eval_record_name(
-                eval_dataset_id,
-                epoch=value if mode == "epoch" else None,
-                step=value if mode == "step" else None,
-            )
-            record = self.task_db.create_record(record_name)
-            eval_context = self.get_eval_task_context(record)
-            eval_context.initialize(
-                eval_dataset_id,
-                epoch=value if mode == "epoch" else None,
-                step=value if mode == "step" else None,
-            )
-    
-        return record
+        record = self.task_db.create_record(record_name)
+        eval_context = EvalTaskContext(
+            work_record=self.work_record,
+            task_record=record,
+            config_manager=self.config_manager,
+        )
+        eval_context.initialize(
+            eval_dataset_id,
+            epoch=epoch_arg,
+            step=step_arg,
+        )
+        self._invalidate_task_cache()
+        return eval_context
 
 
     def make_all_eval_tasks(self, check_weight: bool = True)->None:
-        metadata = self.metadata
-
-        train_ctx = self._get_train_task_context() if check_weight else None
-        print(metadata.get("eval_epochs", []))
-        for dataset_id in metadata["eval_dataset_ids"]:
-            for id in metadata.get("eval_epochs", []):
+        train_ctx = self.train_task() if check_weight else None
+        for dataset_id in self.eval_dataset_ids:
+            for epoch in self.eval_epochs:
                 self.make_eval_task(
                     dataset_id,
-                    epoch=id,
+                    epoch=epoch,
                     check_weight=check_weight,
                     train_ctx=train_ctx,
                 )
-            for id in metadata.get("eval_steps", []):
+            for step in self.eval_steps:
                 self.make_eval_task(
                     dataset_id,
-                    step=id,
+                    step=step,
                     check_weight=check_weight,
                     train_ctx=train_ctx,
                 )
 
 
-
-    def get_eval_command(
-        self,
-        eval_dataset_id,
-        epoch=None,
-        step=None,
-        *,
-        check_result: bool = True,
-        check_weight: bool = True,
-        check_range: bool = True,
-    ) -> Optional[str]:
-        record = self.get_eval_task_record(eval_dataset_id, epoch=epoch, step=step)
-        if record is None:
-            return None
-        context = self.get_eval_task_context(record)
-        metadata = context.metadata
-        if metadata['type'] != "test":
-            return None
-        task_epoch = metadata.get('epoch', None)
-        task_step = metadata.get('step', None)
-        if (task_epoch is None) == (task_step is None):
-            raise ValueError(
-                "Eval task metadata must contain exactly one of epoch or step."
-            )
-        if check_result and context.is_evaluated():
-            return None
-
-        if check_range and not self.is_eval_point_in_metadata(epoch=task_epoch, step=task_step):
-            return None
-
-        if check_weight:
-            train_ctx = self._get_train_task_context()
-            if train_ctx is None:
-                return None
-            if not self._eval_checkpoint_exists(train_ctx, epoch=task_epoch, step=task_step):
-                return None
-        return context.make_eval_command()
-
-    
-
-    def get_all_eval_command(
-        self,
-        check_result: bool = True,
-        check_weight: bool = True,
-        check_range: bool = True,
-    ) -> List[str]:
-        commands = []
-        for id in self.task_db.ids:
-            record = self.task_db.get_record(id)
-            context = self.get_eval_task_context(record)
-            metadata = context.metadata
-            if metadata['type'] != "test":
-                continue
-            cmd = self.get_eval_command(
-                metadata['dataset_id'],
-                epoch=metadata.get('epoch'),
-                step=metadata.get('step'),
-                check_result=check_result,
-                check_weight=check_weight,
-                check_range=check_range,
-            )
-            if cmd is not None:
-                commands.append(cmd)
-        return commands
 
 
     @property
     def all_eval_checkpoints_exist(self) -> bool:
-        train_ctx = self._get_train_task_context()
+        train_ctx = self.train_task()
         if train_ctx is None:
             return False
-        work_metadata = self.metadata
-        for epoch in work_metadata.get("eval_epochs", []):
-            if not self._eval_checkpoint_exists(train_ctx, epoch=epoch):
+        for epoch in self.eval_epochs:
+            if not self.has_eval_checkpoint(epoch=epoch, train_ctx=train_ctx):
                 return False
-        for step in work_metadata.get("eval_steps", []):
-            if not self._eval_checkpoint_exists(train_ctx, step=step):
+        for step in self.eval_steps:
+            if not self.has_eval_checkpoint(step=step, train_ctx=train_ctx):
                 return False
         return True
 
@@ -366,6 +321,14 @@ class TaskContext:
         self.work_record = work_record
         self.task_record = task_record
         self.config_manager = config_manager
+
+    @property
+    def id(self):
+        return self.task_record.id
+
+    @cached_property
+    def path(self)->Path:
+        return self.task_record.path
 
     def get_task_path(self)->GCHRecord:
         return self.task_record
@@ -406,10 +369,6 @@ class TaskContext:
     def write_prop(self, text:str)->None:
         with open(self.prop_path, "w") as f:
             f.write(text)
-
-
-    def make_eval_command(self)->str:
-        return f"python /home/src/atomicstr/openocr/tools/eval_rec.py --work_id {self.work_record.id} --task_id {self.task_record.id}"
 
 
 
@@ -495,6 +454,25 @@ class TrainTaskContext(TaskContext):
 
 class EvalTaskContext(TaskContext):
 
+    @property
+    def dataset_id(self):
+        dataset_id = self.metadata.get('dataset_id')
+        if dataset_id is None:
+            raise ValueError("Eval task must have dataset id in metadata, but it's not set")
+        return dataset_id
+
+    @property
+    def eval_point(self):
+        epoch = self.metadata.get('epoch', None)
+        step = self.metadata.get('step', None)
+        if (epoch is None) == (step is None):
+            raise ValueError(
+                "Eval task metadata must contain exactly one of epoch or step."
+            )
+        if epoch is not None:
+            return "epoch", int(epoch)
+        return "step", int(step)
+
     def initialize(self, eval_dataset_id, epoch=None, step=None)->None:
         if (epoch is None) == (step is None):
             raise ValueError("Exactly one of epoch or step must be provided.")
@@ -532,10 +510,9 @@ class EvalTaskContext(TaskContext):
 
         self.write_config(config)
 
+    def make_eval_command(self)->str:
+        return f"python /home/src/atomicstr/openocr/tools/eval_rec.py --work_id {self.work_record.id} --task_id {self.task_record.id}"
 
-    def make_train_command(self)->str:
-        return f"python /home/src/atomicstr/openocr/tools/train_rec.py --work_id {self.work_record.id} --task_id {self.task_record.id}"
-    
     @cached_property
     def eval_result_path(self)->Path:
         return self.task_record.path / "eval_result.yml"

@@ -411,8 +411,8 @@ class TrainTaskContext(TaskContext):
         """)
         self.write_config(config)
 
-    def make_train_command(self)->str:
-        return f"python /home/src/atomicstr/openocr/tools/train_rec.py --work_id {self.work_record.id} --task_id {self.task_record.id}"
+    # def make_train_command(self)->str:
+    #     return f"python /home/src/atomicstr/openocr/tools/train_rec.py --work_id {self.work_record.id} --task_id {self.task_record.id}"
     
 
     def does_weight_exists(self, epoch:int)->bool:
@@ -510,8 +510,8 @@ class EvalTaskContext(TaskContext):
 
         self.write_config(config)
 
-    def make_eval_command(self)->str:
-        return f"python /home/src/atomicstr/openocr/tools/eval_rec.py --work_id {self.work_record.id} --task_id {self.task_record.id}"
+    # def make_eval_command(self)->str:
+    #     return f"python /home/src/atomicstr/openocr/tools/eval_rec.py --work_id {self.work_record.id} --task_id {self.task_record.id}"
 
     @cached_property
     def eval_result_path(self)->Path:
